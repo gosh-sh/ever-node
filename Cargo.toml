@@ -58,6 +58,9 @@ ton_types = { git = 'https://github.com/tonlabs/ever-types.git', tag = '2.0.18' 
 ton_vm = { git = 'https://github.com/tonlabs/ever-vm.git', tag = '1.8.189' }
 validator_session = { path = 'validator-session' }
 
+[patch.'https://github.com/tonlabs/ever-vm.git']
+ton_vm = { git = 'https://github.com/gosh-sh/ever-vm.git', branch = 'feature/gosh_hash_1.8.189' }
+
 [features]
 default = [ 'telemetry' ]
 export_key = [ 'catchain/export_key', 'ton_types/export_key' ]
