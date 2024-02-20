@@ -44,6 +44,7 @@ use crate::{
     shard_states_keeper::ShardStatesKeeper,
     types::awaiters_pool::AwaitersPool,
     validator::{
+        candidate_db::{CandidateDb, CandidateDbPool},
         remp_service::RempService,
         validator_manager::{start_validator_manager, ValidationStatus},
     }
@@ -66,6 +67,7 @@ use crate::{
 
 #[cfg(feature = "telemetry")]
 use adnl::telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter};
+use catchain::SessionId;
 use overlay::QueriesConsumer;
 use std::{
     ops::Deref, sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering, AtomicU64}},
@@ -100,9 +102,14 @@ use crate::config::{
 //maximum number of validated block stats entries in engine's queue
 const MAX_VALIDATED_BLOCK_STATS_ENTRIES_COUNT: usize = 10000; 
 
+#[cfg(test)]
+#[path = "tests/test_engine.rs"]
+mod tests;
+
 pub struct Engine {
     db: Arc<InternalDb>,
     ext_db: Vec<Arc<dyn ExternalDb>>,
+    candidate_db: CandidateDbPool,
     overlay_operations: Arc<dyn OverlayOperations>,
     shard_states_awaiters: AwaitersPool<BlockIdExt, Arc<ShardStateStuff>>,
     block_applying_awaiters: AwaitersPool<BlockIdExt, ()>,
@@ -612,6 +619,7 @@ impl Engine {
         let boot_from_zerostate = general_config.boot_from_zerostate();
         let global_config = general_config.load_global_config()?;
         let test_bundles_config = general_config.test_bundles_config().clone();
+        let external_messages_maximum_queue_length = collator_config.external_messages_maximum_queue_length;
 
         let network = NodeNetwork::new(
             general_config,
@@ -750,9 +758,11 @@ impl Engine {
         let (validated_block_stats_sender, validated_block_stats_receiver) = 
             crossbeam_channel::bounded(MAX_VALIDATED_BLOCK_STATS_ENTRIES_COUNT);
         let now = now_duration().as_secs() as u32;
+        let candidate_db = CandidateDbPool::with_path(db.db_root_dir()?);
         let engine = Arc::new(Engine {
             db,
             ext_db,
+            candidate_db,
             overlay_operations: network.clone() as Arc<dyn OverlayOperations>,
             shard_states_awaiters: AwaitersPool::new(
                 "shard_states_awaiters",
@@ -784,7 +794,7 @@ impl Engine {
                 engine_telemetry.clone(),
                 engine_allocated.clone()
             ),
-            external_messages: Arc::new(MessagesPool::new(now)),
+            external_messages: Arc::new(MessagesPool::new(now, external_messages_maximum_queue_length)),
             servers: lockfree::queue::Queue::new(),
             remp_client,
             remp_service,
@@ -1103,6 +1113,14 @@ impl Engine {
 
     pub fn set_remp_capability(&self, value: bool) {
         self.remp_capability.store(value, Ordering::Relaxed);
+    }
+
+    pub fn get_candidate_table(&self, session_id: &SessionId) -> Result<Arc<CandidateDb>> {
+        self.candidate_db.get_db(session_id)
+    }
+
+    pub fn destroy_candidate_table(&self, session_id: &SessionId) -> Result<bool> {
+        self.candidate_db.destroy_db(session_id)
     }
 
     pub fn split_queues_cache(&self) -> 
@@ -1533,7 +1551,7 @@ impl Engine {
                                 self.clone().process_queue_update_broadcast(broadcast, src);
                             }
                             Broadcast::TonNode_ExternalMessageBroadcast(broadcast) => {
-                                self.process_ext_msg_broadcast(broadcast, src);
+                                self.process_ext_msg_broadcast(broadcast, src).await;
                             }
                             Broadcast::TonNode_IhrMessageBroadcast(broadcast) => {
                                 log::trace!("TonNode_IhrMessageBroadcast from {}: {:?}", src, broadcast);
@@ -1544,6 +1562,7 @@ impl Engine {
                             Broadcast::TonNode_ConnectivityCheckBroadcast(broadcast) => {
                                 self.network.clone().process_connectivity_broadcast(broadcast);
                             }
+                            Broadcast::TonNode_BlockCandidateBroadcast(_) => { }
                         }
                     }
                 }
@@ -1759,7 +1778,7 @@ impl Engine {
         });
     }
 
-    fn process_ext_msg_broadcast(&self, broadcast: ExternalMessageBroadcast, src: Arc<KeyId>) {
+    async fn process_ext_msg_broadcast(&self, broadcast: ExternalMessageBroadcast, src: Arc<KeyId>) {
         let remp = self.remp_capability();
         // just add to list
         if !self.is_validator() {
@@ -1768,26 +1787,26 @@ impl Engine {
                 "Skipped ext message broadcast {}bytes from {}: NOT A VALIDATOR",
                 broadcast.message.data.0.len(), src
             );
-        } else if remp {
-            log::warn!(
-                "Skipped ext message broadcast {}bytes from {}: REMP CAPABILITY IS ENABLED",
-                broadcast.message.data.0.len(), src
-            );
         } else {
-            log::trace!("Processing ext message broadcast {}bytes from {}", broadcast.message.data.0.len(), src);
-            match self.external_messages().new_message_raw(&broadcast.message.data.0, self.now()) {
+            let bytes_len = broadcast.message.data.0.len();
+            let result = if remp {
+                self.push_message_to_remp(broadcast.message.data).await
+            } else {
+                self.external_messages().new_message_raw(&broadcast.message.data.0, self.now())
+            };
+            match result {
                 Err(e) => {
                     log::error!(
                         target: EXT_MESSAGES_TRACE_TARGET,
                         "Error while processing ext message broadcast {}bytes from {}: {}",
-                        broadcast.message.data.0.len(), src, e
+                        bytes_len, src, e
                     );
                 }
-                Ok(id) => {
+                Ok(_) => {
                     log::debug!(
                         target: EXT_MESSAGES_TRACE_TARGET,
-                        "Processed ext message broadcast {:x} {}bytes from {} (added into collator's queue)",
-                        id, broadcast.message.data.0.len(), src
+                        "Processed ext message broadcast {}bytes from {} (added into remp's queue)",
+                        bytes_len, src
                     );
                 }
             }
@@ -2361,8 +2380,11 @@ pub(crate) async fn load_zero_state(engine: &Arc<Engine>, path: &str) -> Result<
 
 }
 
-async fn boot(engine: &Arc<Engine>, zerostate_path: Option<&str>, hardfork_path: impl AsRef<Path>)
--> Result<(BlockIdExt, BlockIdExt, BlockIdExt, BlockIdExt, BlockIdExt)> {
+async fn boot(
+    engine: &Arc<Engine>, 
+    zerostate_path: Option<&str>, 
+    hardfork_path: impl AsRef<Path>
+) -> Result<(BlockIdExt, BlockIdExt, BlockIdExt, BlockIdExt, BlockIdExt)> {
     log::info!("Booting...");
     engine.set_sync_status(Engine::SYNC_STATUS_START_BOOT);
 
@@ -2500,7 +2522,7 @@ pub async fn run(
                     DataSource::Engine(engine.clone()),
                     engine.network().config_handler(),
                     engine.network().config_handler(),
-                    Some(engine.network().clone())
+                    Some(engine.network())
                 ).await?
             );
             engine.register_server(server)
@@ -2836,6 +2858,7 @@ pub fn init_prometheus_exporter() {
         .install().expect("Could not create PrometheusRecorder");
 }
 
+// TODO: move to ton_types crate
 pub fn now_duration() -> Duration {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default()
 }

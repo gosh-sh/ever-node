@@ -100,6 +100,7 @@ pub async fn accept_block(
     if id.shard().is_masterchain() {
         log::debug!(target: "validator", "({}): Applying block", block_descr);
         engine.clone().apply_block(&handle, &block, id.seq_no(), false).await?;
+        log::trace!(target: "validator", "acccept_block {}: applied block", id);
     } else {
         let last_mc_state = choose_mc_state(&block, &engine).await?;
 
@@ -215,7 +216,13 @@ pub async fn accept_block_routine(
     let block = match block_opt {
         Some(b) => b,
         None => {
-            let (block, _proof) = engine.download_block(&id, Some(10)).await?;
+            let block = match &handle_opt {
+                Some(h) if h.has_data() => engine.load_block(h).await?,
+                _ => {
+                    let (block, _proof) = engine.download_block(&id, Some(10)).await?;
+                    block
+                }
+            };
             precheck_header(&block, prev, is_fake, is_fork)?;
             block
         }
@@ -778,6 +785,8 @@ fn build_block_broadcast(
 
 ) -> Result<BlockBroadcast> {
 
+    log::trace!(target: "validator", "accept_block {}: build_block_broadcast", block.id());
+
     let mut packed_signatures = vec!();
 
     signatures.pure_signatures.signatures().iterate_slices(|ref mut _key, ref mut slice| {
@@ -785,7 +794,7 @@ fn build_block_broadcast(
         packed_signatures.push(
             BlockSignature {
                 who: UInt256::with_array(*sign.node_id_short.as_slice()),
-                signature: ton_api::ton::bytes(sign.sign.to_bytes().to_vec())
+                signature: ton_api::ton::bytes(sign.sign.as_bytes().to_vec())
             }
         );
         Ok(true)
@@ -809,6 +818,8 @@ fn build_queue_update_broadcasts(
     signatures: &BlockSignatures,
 ) -> Result<Vec<QueueUpdateBroadcast>> {
 
+    log::trace!(target: "validator", "accept_block {}: build_queue_update_broadcasts", block.id());
+
     let mut packed_signatures = vec!();
     let mut broadcasts = vec!();
 
@@ -817,7 +828,7 @@ fn build_queue_update_broadcasts(
         packed_signatures.push(
             BlockSignature {
                 who: UInt256::with_array(*sign.node_id_short.as_slice()),
-                signature: ton_api::ton::bytes(sign.sign.to_bytes().to_vec())
+                signature: ton_api::ton::bytes(sign.sign.as_bytes().to_vec())
             }
         );
         Ok(true)

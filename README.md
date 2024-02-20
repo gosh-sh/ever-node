@@ -1,9 +1,3 @@
-<p align="center">
-  <a href="https://github.com/venom-blockchain/developer-program">
-    <img src="https://raw.githubusercontent.com/venom-blockchain/developer-program/main/vf-dev-program.png" alt="Logo" width="366.8" height="146.4">
-  </a>
-</p>
-
 # ever-node
 
 Everscale/Venom node and validator
@@ -26,12 +20,26 @@ Implementation of Everscal/Venom node and validator in safe Rust.
 
 Rust complier v1.65+.
 
+```
+apt-get update
+apt-get install pkg-config make clang libssl-dev libzstd-dev libgoogle-perftools-dev
+```
+
 ### Installing
 
 ```
 git clone --recurse-submodules https://github.com/tonlabs/ever-node.git
 cd ever-node
 cargo build --release
+```
+
+### Running tests
+
+```
+cargo test --release --package catchain -- --nocapture --test-threads=1 
+cargo test --release --package storage -- --nocapture --test-threads=1 
+cargo test --release --package validator_session -- --nocapture --test-threads=1 
+cargo test --release -- --nocapture --test-threads=1
 ```
 
 ## Usage

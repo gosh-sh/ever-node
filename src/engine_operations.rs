@@ -28,7 +28,6 @@ use crate::{
     ext_messages::{create_ext_message, EXT_MESSAGES_TRACE_TARGET},
     jaeger,
     validator::{
-        candidate_db::CandidateDb,
         validator_manager::ValidationStatus,
         validator_utils::validatordescr_to_catchain_node,
     }, shard_states_keeper::PinnedShardStateGuard
@@ -55,7 +54,7 @@ use ton_api::{
     ton::ton_node::{
         RempMessage, RempMessageStatus, RempReceipt, 
         broadcast::{BlockBroadcast, QueueUpdateBroadcast}
-    }
+    }, IntoBoxed
 };
 use ton_block::{
     MASTERCHAIN_ID, SHARD_FULL, GlobalCapabilities, OutMsgQueue,
@@ -321,10 +320,7 @@ impl EngineOperations for Engine {
         session_id: &SessionId, 
         candidate: ValidatorBlockCandidate
     ) -> Result<()> {
-        CandidateDb::with_path(
-            self.db_root_dir()?,
-            &format!("catchains/candidates{:x}", session_id)
-        )?.save(candidate)
+        self.get_candidate_table(session_id)?.save(candidate)
     }
 
     fn load_block_candidate(
@@ -332,17 +328,11 @@ impl EngineOperations for Engine {
         session_id: &SessionId, 
         root_hash: &BlockHash
     ) -> Result<Arc<ValidatorBlockCandidate>> {
-        CandidateDb::with_path(
-            self.db_root_dir()?,
-            &format!("catchains/candidates{:x}", session_id)
-        )?.load(root_hash)
+        self.get_candidate_table(session_id)?.load(root_hash)
     }
 
     fn destroy_block_candidates(&self, session_id: &SessionId) -> Result<bool> {
-        CandidateDb::with_path(
-            self.db_root_dir()?,
-            &format!("catchains/candidates{:x}", session_id)
-        )?.destroy()
+        self.destroy_candidate_table(session_id)
     }
 
     async fn apply_block_internal(
@@ -358,7 +348,7 @@ impl EngineOperations for Engine {
         while !((pre_apply && handle.has_state()) || handle.is_applied()) {
             self.block_applying_awaiters().do_or_wait(
                 handle.id(),
-                None,
+                Some(1000),
                 self.clone().apply_block_worker(handle, block, mc_seq_no, pre_apply, recursion_depth)
             ).await?;
         }
@@ -382,7 +372,8 @@ impl EngineOperations for Engine {
     ) -> Result<(BlockStuff, Option<BlockProofStuff>)> {
         loop {
             if let Some(handle) = self.load_block_handle(id)? {
-                if handle.has_data() {
+                let mut is_link = false;
+                if handle.has_data() && handle.has_proof_or_link(&mut is_link) {
                     let block = self.load_block(&handle).await?;
                     let proof = if !handle.is_queue_update() {
                         Some(self.load_block_proof(&handle, !id.shard().is_masterchain()).await?)
@@ -429,6 +420,7 @@ impl EngineOperations for Engine {
         root_hash: &UInt256,
         master_id: &BlockIdExt,
         active_peers: &Arc<lockfree::set::Set<Arc<KeyId>>>,
+        bad_peers: &mut HashSet<Arc<KeyId>>,
         attempts: Option<usize>
     ) -> Result<Arc<ShardStateStuff>> {
 
@@ -448,6 +440,7 @@ impl EngineOperations for Engine {
             master_id,
             overlay.deref(),
             active_peers,
+            bad_peers,
             attempts,
             &|| {
                 if self.check_stop() {
@@ -742,10 +735,12 @@ impl EngineOperations for Engine {
 
     async fn download_next_key_blocks_ids(
         &self, 
-        block_id: &BlockIdExt, 
+        block_id: &BlockIdExt,
+        active_peers: &Arc<lockfree::set::Set<Arc<KeyId>>>,
+        bad_peers: &mut HashSet<Arc<KeyId>>,
     ) -> Result<Vec<BlockIdExt>> {
         let mc_overlay = self.get_masterchain_overlay().await?;
-        mc_overlay.download_next_key_blocks_ids(block_id, 5).await
+        mc_overlay.download_next_key_blocks_ids(block_id, 5, active_peers, bad_peers).await
     }
 
     async fn set_applied(
@@ -960,13 +955,18 @@ impl EngineOperations for Engine {
     }
 
     fn get_external_messages_iterator(
-        &self, 
-        shard: ShardIdent
+        &self,
+        shard: ShardIdent,
+        finish_time_ms: u64
     ) -> Box<dyn Iterator<Item = (Arc<Message>, UInt256)> + Send + Sync> {
-        Box::new(self.external_messages().clone().iter(shard, self.now()))
+        Box::new(self.external_messages().clone().iter(shard, self.now(), finish_time_ms))
     }
 
-    fn complete_external_messages(&self, to_delay: Vec<UInt256>, to_delete: Vec<UInt256>) -> Result<()> {
+    fn get_external_messages_len(&self) -> u32 {
+        self.external_messages().total_messages()
+    }
+
+    fn complete_external_messages(&self, to_delay: Vec<(UInt256, String)>, to_delete: Vec<(UInt256, i32)>) -> Result<()> {
         self.external_messages().complete_messages(to_delay, to_delete, self.now())
     }
 
@@ -999,6 +999,24 @@ impl EngineOperations for Engine {
             .ok_or_else(|| error!("Can't get message status because remp service was not set"))?
             .remp_core_interface()?
             .check_remp_duplicate(message_id)
+    }
+
+    async fn push_message_to_remp(&self, data: ton_api::ton::bytes) -> Result<()> {
+        let (id, _message) = create_ext_message(&data.0)?;
+        let remp_message = ton_api::ton::ton_node::rempmessage::RempMessage {
+            message: data,
+            id: id.clone(),
+            timestamp: 0,
+            signature: Vec::new().into()
+        }.into_boxed();
+        let zero_source = Arc::new(KeyId::from_data([0; 32]));
+        self.network().remp().messages_subscriber()?.new_remp_message(
+            remp_message, &zero_source).await?;
+        Ok(())
+    }
+
+    fn remp_capability(&self) -> bool {
+        Engine::remp_capability(self)
     }
 
     // Get current list of new shard blocks with respect to last mc block.

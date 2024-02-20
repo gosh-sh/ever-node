@@ -44,7 +44,6 @@ mod profiling {
 pub mod ton {
     pub use ton_api::ton::int;
     pub use ton_api::ton::rpc::validator_session::*;
-    pub use ton_api::ton::validator_session::round::validator_session::*;
     pub use ton_api::ton::validator_session::*;
 
     pub mod blockid {
@@ -258,6 +257,24 @@ pub struct SessionOptions {
 
     /// Use Catchain in receive only mode (for debugging and log replay)
     pub catchain_skip_processed_blocks: bool,
+
+    /// Receiver: max number of neighbours to synchronize
+    pub catchain_receiver_max_neighbours_count: usize,
+
+    /// Receiver: min time for catchain sync with neighbour nodes
+    pub catchain_receiver_neighbours_sync_min_period: std::time::Duration,
+
+    /// Receiver: max time for catchain sync with neighbour nodes
+    pub catchain_receiver_neighbours_sync_max_period: std::time::Duration,
+
+    /// Receiver: max number of attempts to find a source to synchronize
+    pub catchain_receiver_max_sources_sync_attempts: usize,
+
+    /// Receiver: min time for catchain neighbours rotation
+    pub catchain_receiver_neighbours_rotate_min_period: std::time::Duration,
+
+    /// Receiver: max time for catchain neighbours rotation
+    pub catchain_receiver_neighbours_rotate_max_period: std::time::Duration,
 
     /// Number of block candidates per round
     pub round_candidates: u32,

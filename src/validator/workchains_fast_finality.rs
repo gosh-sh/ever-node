@@ -1,7 +1,13 @@
+use std::sync::Arc;
 use ton_types::{Result, fail, error};
 use ton_block::{ShardHashes, ShardIdent, ValidatorSet};
 use crate::shard_state::ShardStateStuff;
+use crate::validator::sessions_computing::SessionValidatorsInfo;
 use crate::validator::validator_utils::ValidatorSubsetInfo;
+
+#[cfg(test)]
+#[path = "tests/test_workchains_fast_finality.rs"]
+mod tests;
 
 /* #[cfg(feature = "fast_finality")]
 fn get_possible_next_collator_range_for_shard(
@@ -32,6 +38,9 @@ fn get_possible_next_collator_range_for_shard(
     }
     Ok(shards.get(0).map(|(_,collator)| collator.clone()))
 } */
+
+/*
+*/
 
 /* #[cfg(feature = "fast_finality")]
 pub fn try_calc_next_subset_for_workchain_fast_finality(

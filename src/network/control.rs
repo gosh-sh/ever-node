@@ -14,8 +14,9 @@
 use crate::{
     collator_test_bundle::CollatorTestBundle, config::{KeyRing, NodeConfigHandler},
     engine_traits::EngineOperations, engine::Engine, network::node_network::NodeNetwork,
+    shard_states_keeper::PinnedShardStateGuard, 
     validator::validator_utils::validatordescr_to_catchain_node,
-    validating_utils::{supported_version, supported_capabilities}, shard_states_keeper::PinnedShardStateGuard
+    validating_utils::{supported_version, supported_capabilities}
 };
 
 use adnl::{
@@ -24,7 +25,7 @@ use adnl::{
 };
 use std::sync::Arc;
 use ton_api::{
-    deserialize_boxed,
+    deserialize_boxed, IntoBoxed,
     ton::{
         self, PublicKey, TLObject, accountaddress::AccountAddress,
         engine::validator::{
@@ -42,13 +43,15 @@ use ton_api::{
         rpc::engine::validator::{
             AddAdnlId, AddValidatorAdnlAddress, AddValidatorPermanentKey, AddValidatorTempKey,
             ControlQuery, ExportPublicKey, GenerateKeyPair, Sign, GetBundle, GetFutureBundle
-        },
-    },
-    IntoBoxed,
+        }
+    }
 };
-use ton_block::{BlockIdExt, MsgAddressInt, Serializable, ShardIdent, MASTERCHAIN_ID, MerkleProof, ShardAccount};
+use ton_block::{
+    BlockIdExt, MsgAddressInt, Serializable, ShardIdent, MASTERCHAIN_ID, MerkleProof, 
+    ShardAccount
+};
 use ton_block_json::serialize_config_param;
-use ton_types::{error, fail, KeyId, read_single_root_boc, Result, UInt256};
+use ton_types::{error, fail, KeyId, read_single_root_boc, Result, UInt256, AccountId};
 
 pub struct ControlServer {
     adnl: AdnlServer
@@ -153,26 +156,27 @@ impl ControlQuerySubscriber {
     }
 
     async fn get_account_state(&self, address: AccountAddress) -> Result<ShardAccountStateBoxed> {
-        Self::convert_account_state(self.find_account(address).await?)
+        let address: MsgAddressInt = address.account_address.parse()?;
+        Self::convert_account_state(self.find_account(&address).await?)
     }
 
     async fn get_account_by_block(&self, account_id: UInt256, block_root_hash: UInt256) -> Result<ShardAccountStateBoxed> {
-        Self::convert_account_state(self.find_account_by_block(account_id, block_root_hash).await?)
+        Self::convert_account_state(self.find_account_by_block(&account_id.into(), &block_root_hash).await?)
     }
 
     async fn get_account_meta(&self, address: AccountAddress) -> Result<ShardAccountMetaBoxed> {
-        Self::convert_account_meta(self.find_account(address).await?)
+        let address: MsgAddressInt = address.account_address.parse()?;
+        Self::convert_account_meta(self.find_account(&address).await?)
     }
 
     async fn get_account_meta_by_block(&self, account_id: UInt256, block_root_hash: UInt256) -> Result<ShardAccountMetaBoxed> {
-        Self::convert_account_meta(self.find_account_by_block(account_id, block_root_hash).await?)
+        Self::convert_account_meta(self.find_account_by_block(&account_id.into(), &block_root_hash).await?)
     }
 
     async fn find_account(
-        &self, address: AccountAddress
+        &self, addr: &MsgAddressInt
     ) -> Result<Option<(ShardAccount, PinnedShardStateGuard)>> {
         let engine = self.engine()?;
-        let addr: MsgAddressInt = address.account_address.parse()?;
         let state = if addr.is_masterchain() {
             let mc_block_id = engine.load_last_applied_mc_block_id()?
                 .ok_or_else(|| error!("Cannot load last_applied_mc_block_id!"))?;
@@ -182,29 +186,29 @@ impl ControlQuerySubscriber {
             let mc_block_id = mc_block_id.ok_or_else(
                 || error!("Cannot load shard_client_mc_block_id!")
             )?;
-            let mc_state = engine.load_state(&mc_block_id).await?;
+            let mc_state = engine.load_and_pin_state(&mc_block_id).await?;
             let mut shard_state = None;
-            for id in mc_state.top_blocks(addr.workchain_id())? {
+            for id in mc_state.state().top_blocks(addr.workchain_id())? {
                 if id.shard().contains_account(addr.address().clone())? {
                     shard_state = engine.load_and_pin_state(&id).await.ok();
                     break;
                 }
             }
             shard_state.ok_or_else(
-                || error!("Cannot find actual shard for account {}", &address.account_address)
+                || error!("Cannot find actual shard for account {}", addr)
             )?
         };
         Ok(state.state().shard_account(&addr.address())?.map(|acc| (acc, state)))
     }
 
     async fn find_account_by_block(
-        &self, account_id: UInt256, block_root_hash: UInt256
+        &self, account_id: &AccountId, block_root_hash: &UInt256
     ) -> Result<Option<(ShardAccount, PinnedShardStateGuard)>> {
         let engine = self.engine()?;
-        let block_id = engine.find_full_block_id(&block_root_hash)?
+        let block_id = engine.find_full_block_id(block_root_hash)?
             .ok_or_else(|| error!("Cannot find full block id by root hash"))?;
         let shard_state = engine.load_and_pin_state(&block_id).await?;
-        Ok(shard_state.state().shard_account(&account_id.into())?.map(|acc| (acc, shard_state)))
+        Ok(shard_state.state().shard_account(account_id)?.map(|acc| (acc, shard_state)))
     }
 
     fn convert_account_state(
@@ -571,6 +575,61 @@ impl ControlQuerySubscriber {
             Err(object) => return Ok(QueryResult::Rejected(object))
         };
         log::debug!("query (control server): {:?}", query);
+        let query = match query.downcast::<ton::rpc::raw::GetShardAccountState>() {
+            Ok(account) => {
+                let answer = self.get_account_state(account.account_address).await?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None
+                )
+            },
+            Err(query) => query
+        };
+        let query = match query.downcast::<ton::rpc::raw::GetShardAccountMeta>() {
+            Ok(account) => {
+                let answer = self.get_account_meta(account.account_address).await?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None
+                )
+            },
+            Err(query) => query
+        };
+        let query = match query.downcast::<ton::rpc::raw::GetAccountByBlock>() {
+            Ok(account) => {
+                let answer = self.get_account_by_block(account.account_id, account.block_root_hash).await?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None
+                )
+            },
+            Err(query) => query
+        };
+        let query = match query.downcast::<ton::rpc::raw::GetAccountMetaByBlock>() {
+            Ok(account) => {
+                let answer = self.get_account_meta_by_block(account.account_id, account.block_root_hash).await?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None
+                )
+            },
+            Err(query) => query
+        };
+        let query = match query.downcast::<ton::rpc::raw::GetAppliedShardsInfo>() {
+            Ok(_) => {
+                let answer = self.get_applied_shards_info().await?;
+                return QueryResult::consume_boxed(
+                    answer,
+                    #[cfg(feature = "telemetry")]
+                    None
+                )
+            },
+            Err(query) => query
+        };
         let query = match query.downcast::<GenerateKeyPair>() {
             Ok(_) => return QueryResult::consume(
                 self.process_generate_keypair().await?,
@@ -667,61 +726,6 @@ impl ControlQuerySubscriber {
             }
             Err(query) => query
         };
-        let query = match query.downcast::<ton::rpc::raw::GetShardAccountState>() {
-            Ok(account) => {
-                let answer = self.get_account_state(account.account_address).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None
-                )
-            },
-            Err(query) => query
-        };
-        let query = match query.downcast::<ton::rpc::raw::GetShardAccountMeta>() {
-            Ok(account) => {
-                let answer = self.get_account_meta(account.account_address).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None
-                )
-            },
-            Err(query) => query
-        };
-        let query = match query.downcast::<ton::rpc::raw::GetAccountByBlock>() {
-            Ok(account) => {
-                let answer = self.get_account_by_block(account.account_id, account.block_root_hash).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None
-                )
-            },
-            Err(query) => query
-        };
-        let query = match query.downcast::<ton::rpc::raw::GetAccountMetaByBlock>() {
-            Ok(account) => {
-                let answer = self.get_account_meta_by_block(account.account_id, account.block_root_hash).await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None
-                )
-            },
-            Err(query) => query
-        };
-        let query = match query.downcast::<ton::rpc::raw::GetAppliedShardsInfo>() {
-            Ok(_) => {
-                let answer = self.get_applied_shards_info().await?;
-                return QueryResult::consume_boxed(
-                    answer,
-                    #[cfg(feature = "telemetry")]
-                    None
-                )
-            },
-            Err(query) => query
-        };
         let query = match query.downcast::<ton::rpc::lite_server::GetConfigParams>() {
             Ok(query) => {
                 let param_number = query.param_list.iter().next().ok_or_else(|| error!("Invalid param_number"))?;
@@ -805,3 +809,6 @@ impl Subscriber for ControlQuerySubscriber {
     }
 }
 
+#[cfg(test)]
+#[path = "../tests/test_control.rs"]
+mod tests;

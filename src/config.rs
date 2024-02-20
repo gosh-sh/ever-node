@@ -86,7 +86,10 @@ pub struct CollatorConfig {
     pub max_collate_threads: u32,
     pub retry_if_empty: bool,
     pub finalize_empty_after_ms: u32,
-    pub empty_collation_sleep_ms: u32
+    pub empty_collation_sleep_ms: u32,
+    pub external_messages_timeout_percentage_points: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_messages_maximum_queue_length: Option<u32>, // None - unlimited
 }
 impl Default for CollatorConfig {
     fn default() -> Self {
@@ -99,7 +102,9 @@ impl Default for CollatorConfig {
             max_collate_threads: 10,
             retry_if_empty: false,
             finalize_empty_after_ms: 800,
-            empty_collation_sleep_ms: 100
+            empty_collation_sleep_ms: 100,
+            external_messages_timeout_percentage_points: 100, // 0.1 = 10% = 100ms
+            external_messages_maximum_queue_length: None,
         }
     }
 }
@@ -274,29 +279,46 @@ pub struct ExternalDbConfig {
 
 #[derive(Debug, Default, serde::Deserialize, serde::Serialize, Clone)]
 pub struct RempConfig {
-    client_enabled: bool,
+    client_enabled: Option<bool>,
     remp_client_pool: Option<u8>,
-    service_enabled: bool,
+    service_enabled: Option<bool>,
+    message_queue_max_len: Option<usize>,
+    max_incoming_broadcast_delay_millis: Option<u32>,
 }
 
 impl RempConfig {
+    #[cfg(test)]
+    pub fn create_empty() -> Self {
+        Self {
+            client_enabled: None,
+            remp_client_pool: None,
+            service_enabled: None,
+            message_queue_max_len: None,
+            max_incoming_broadcast_delay_millis: None,
+        }
+    }
 
     pub fn is_client_enabled(&self) -> bool {
-        self.client_enabled
+        self.client_enabled.unwrap_or(true)
     }
 
     pub fn is_service_enabled(&self) -> bool {
-        self.service_enabled
+        self.service_enabled.unwrap_or(true)
     }
+
+    pub fn get_message_queue_max_len(&self) -> Option<usize> {
+        self.message_queue_max_len
+    }
+
+    pub fn get_max_incoming_broadcast_delay_millis(&self) -> u32 { self.max_incoming_broadcast_delay_millis.unwrap_or(1000) }
 
     pub fn get_catchain_options(&self) -> Option<catchain::Options> {
         if self.is_service_enabled() {
-            Some(catchain::Options {
-                idle_timeout: std::time::Duration::from_secs(5),
-                max_deps: 2,
-                debug_disable_db: false,
-                skip_processed_blocks: false
-            })
+            let mut opts = catchain::Options::default();
+            opts.idle_timeout = std::time::Duration::from_secs(5);
+            opts.max_deps = 2;
+
+            Some(opts)
         } else {
             None
         }
@@ -553,6 +575,11 @@ impl TonNodeConfig {
         self.gc.as_ref().map(|c| c.enable_for_shard_state_persistent).unwrap_or(false)
     }
     
+    #[cfg(test)]
+    pub fn set_internal_db_path(&mut self, path: String) {
+        self.internal_db_path.replace(path);
+    }
+
     pub fn default_rldp_roundtrip(&self) -> Option<u32> {
         self.default_rldp_roundtrip_ms
     }
@@ -591,6 +618,11 @@ impl TonNodeConfig {
     }
     pub fn cells_db_config(&self) -> &CellsDbConfig {
         &self.cells_db_config
+    }
+
+    #[cfg(test)]
+    pub fn set_port(&mut self, port: u16) {
+        self.port.replace(port);
     }
 
     pub fn collator_config(&self) -> &CollatorConfig {

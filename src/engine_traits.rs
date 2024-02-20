@@ -361,7 +361,12 @@ pub trait EngineOperations : Sync + Send {
     async fn download_next_block(&self, prev_id: &BlockIdExt) -> Result<(BlockStuff, BlockProofStuff)> {
         unimplemented!()
     }
-    async fn download_next_key_blocks_ids(&self, block_id: &BlockIdExt) -> Result<Vec<BlockIdExt>> {
+    async fn download_next_key_blocks_ids(
+        &self,
+        block_id: &BlockIdExt,
+        active_peers: &Arc<lockfree::set::Set<Arc<KeyId>>>,
+        bad_peers: &mut HashSet<Arc<KeyId>>,
+    ) -> Result<Vec<BlockIdExt>> {
         unimplemented!()
     }
     async fn store_block(
@@ -463,6 +468,7 @@ pub trait EngineOperations : Sync + Send {
         root_hash: &UInt256,
         master_id: &BlockIdExt,
         active_peers: &Arc<lockfree::set::Set<Arc<KeyId>>>,
+        bad_peers: &mut HashSet<Arc<KeyId>>,
         attempts: Option<usize>
     ) -> Result<Arc<ShardStateStuff>> {
         unimplemented!()
@@ -596,12 +602,18 @@ pub trait EngineOperations : Sync + Send {
         unimplemented!()
     }
     fn get_external_messages_iterator(
-        &self, 
-        shard: ShardIdent
+        &self,
+        shard: ShardIdent,
+        finish_time_ms: u64
     ) -> Box<dyn Iterator<Item = (Arc<Message>, UInt256)> + Send + Sync> {
         unimplemented!()
     }
-    fn complete_external_messages(&self, to_delay: Vec<UInt256>, to_delete: Vec<UInt256>) -> Result<()> {
+    fn get_external_messages_len(&self) -> u32 { 0 }
+    fn complete_external_messages(
+        &self, 
+        to_delay: Vec<(UInt256, String)>, 
+        to_delete: Vec<(UInt256, i32)>
+    ) -> Result<()> {
         unimplemented!()
     }
 
@@ -749,6 +761,14 @@ pub trait EngineOperations : Sync + Send {
 
     async fn check_remp_duplicate(&self, message_id: &UInt256) -> Result<RempDuplicateStatus> {
         unimplemented!()
+    }
+
+    async fn push_message_to_remp(&self, data: ton_api::ton::bytes) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn remp_capability(&self) -> bool { 
+        false 
     }
 
     async fn update_validators(
