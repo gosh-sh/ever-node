@@ -1412,7 +1412,7 @@ impl ValidateQuery {
         };
         to_mint_config.iterate_with_keys(|curr_id: u32, amount| {
             let amount2 = base.prev_state_extra.global_balance.get_other(curr_id)?.unwrap_or_default();
-            if amount >= amount2 {
+            if amount > amount2 {
                 let mut delta = amount.clone();
                 delta.sub(&amount2)?;
                 log::debug!(target: "validate_query", "({}): currency #{}: existing {}, required {}, to be minted {}",
